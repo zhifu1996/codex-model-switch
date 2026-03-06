@@ -2,15 +2,15 @@
 
 ## 简介
 
-Codex Model Switch 是一个交互式工具，用于快速切换 Codex CLI 的默认模型。它会读取 `~/.codex/config.toml` 和 `~/.codex/auth.json`，自动获取可用模型列表，并将选中的模型写回配置文件。
+Codex Model Switch 是一个交互式工具，用于快速切换 Codex CLI 的默认模型。整体交互布局参考 `claude-model-switch`，包括两列模型展示、分组菜单和批量操作区。
 
 ## 特性
 
 - 自动从 API 获取可用模型列表
-- 支持交互式切换、按编号切换、按模型名直接切换
-- 支持 JSON 列表输出（便于脚本集成）
-- 自动高亮当前模型
-- 兼容多种模型列表接口路径
+- 两列显示与当前模型高亮
+- 支持交互模式、按编号切换、按模型名直接设置
+- 支持脚本同步更新到 `~/.local/bin`
+- 自动生成 `~/.codex/tools` 下的工具配置
 
 ## 安装
 
@@ -23,9 +23,9 @@ source ~/.bashrc
 
 安装脚本会：
 
-- 安装主脚本到 `~/.local/bin/.codex-model-switch-bin`
-- 安装卸载脚本到 `~/.local/bin/codex-model-switch-uninstall`
-- 在 `~/.bashrc` 中添加 `codex-model-switch` shell 函数
+- 安装脚本到 `~/.local/bin/.codex-model-switch-bin`
+- 安装卸载脚本 `codex-model-switch-uninstall`
+- 在 `~/.bashrc` 添加 `codex-model-switch` shell 函数
 - 确保 `~/.local/bin` 在 PATH 中
 
 ## 使用方法
@@ -39,17 +39,41 @@ codex-model-switch
 ### 命令行模式
 
 ```bash
-codex-model-switch --list
-codex-model-switch --list-json
-codex-model-switch 10
-codex-model-switch --set gpt-5.3-codex
-codex-model-switch --show-config
-codex-model-switch --help
+codex-model-switch --list          # 列出所有模型（JSON 格式）
+codex-model-switch 3               # 切换到第 3 个模型
+codex-model-switch --set gpt-5     # 直接设置模型名
+codex-model-switch --update        # 同步脚本到 ~/.local/bin
+codex-model-switch --show-config   # 显示当前解析配置
+codex-model-switch --help          # 显示帮助
 ```
 
-## 配置要求
+## 主界面说明
 
-`~/.codex/config.toml` 至少包含：
+```text
+============================================================
+             Codex CLI Model Switch
+============================================================
+
+API: https://your-endpoint
+
+Current Configuration:
+  Main Model (model):                gpt-5.3-codex
+  Provider (model_provider):         cliproxyapi
+  Wire API:                          responses
+
+--- GPT/Codex Models (...) ---
+... 两列展示 ...
+
+--- Batch Operations ---
+  [a] Custom model name input
+  [r] Refresh model list
+  [u] Sync scripts to ~/.local/bin
+  [q] Quit
+```
+
+## 配置文件要求
+
+`~/.codex/config.toml` 至少需要：
 
 ```toml
 model_provider = "cliproxyapi"
@@ -69,13 +93,16 @@ wire_api = "responses"
 }
 ```
 
-## 工作原理
+## 更新脚本
 
-1. 从 `~/.codex/config.toml` 读取 provider 和 `base_url`
-2. 从环境变量或 `~/.codex/auth.json` 解析 API key
-3. 自动尝试常见模型列表接口路径
-4. 解析模型列表后展示并支持切换
-5. 更新 `~/.codex/config.toml` 顶层的 `model = "..."` 字段
+修改项目文件后，同步到 `~/.local/bin`：
+
+```bash
+cd /path/to/codex-model-switch
+./codex-model-switch --update
+# 或
+./install.sh
+```
 
 ## 卸载
 
@@ -87,20 +114,21 @@ codex-model-switch-uninstall
 
 - `~/.local/bin/.codex-model-switch-bin`
 - `~/.local/bin/codex-model-switch-uninstall`
-- 可选 `~/.codex/tools/model-list.json` / `model.json`
-- `~/.bashrc` 中的 `codex-model-switch` shell 函数
+- `~/.codex/tools/model-list.json`
+- `~/.codex/tools/model.json`
+- `~/.bashrc` 中的 shell 函数
 
 ## 常见问题
 
-### Q: 为什么拉取不到模型列表？
+### Q: 为什么获取不到模型列表？
 
-先检查：
+检查：
 
-1. `~/.codex/config.toml` 中 provider 和 `base_url` 是否正确
-2. `~/.codex/auth.json` 中 API key 是否有效
-3. 网络是否可访问对应 `base_url`
+1. `~/.codex/config.toml` 里的 `base_url` 是否可访问
+2. `~/.codex/auth.json` 中 token 是否有效
+3. 网络与 DNS 是否正常
 
-### Q: 如何查看当前解析到的配置？
+### Q: 如何确认当前读取到的配置？
 
 ```bash
 codex-model-switch --show-config

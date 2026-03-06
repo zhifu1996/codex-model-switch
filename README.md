@@ -1,22 +1,51 @@
 # Codex Model Switch
 
-A CLI tool for quickly switching Codex CLI default models. It reads provider info from `~/.codex/config.toml`, reads API key from `~/.codex/auth.json` (or env), fetches available models from your configured endpoint, and updates the selected model in `~/.codex/config.toml`.
+A CLI tool for quickly switching Codex CLI default models. Automatically fetches available models from your configured provider endpoint in `~/.codex/config.toml`.
 
 ## Features
 
-- Automatically fetches available models from provider endpoints
-- Reads current config from `~/.codex/config.toml`
-- Supports model switch by:
-  - Interactive menu
-  - Index number
-  - Direct model id (`--set`)
-- Displays the current model with `*`
-- Supports JSON output for tooling (`--list-json`)
+- Automatically fetches available models from your API
+- Two-column display with alphabetical sorting (same interaction style as `claude-model-switch`)
+- Highlights currently selected model
+- Batch operations (custom model input, refresh list, sync script)
+- Supports command line switching by index
+- Supports script sync/update functionality
+- Can auto-generate Codex tool definitions in `~/.codex/tools`
+
+## Screenshot
+
+```text
+============================================================
+             Codex CLI Model Switch
+============================================================
+
+API: https://your-endpoint
+
+Current Configuration:
+  Main Model (model):                gpt-5.3-codex
+  Provider (model_provider):         cliproxyapi
+  Wire API:                          responses
+
+--- GPT/Codex Models (12) ---
+1. gpt-5                             7. gpt-5.1-codex-mini
+2. gpt-5-codex                       8. gpt-5.2
+...
+
+--- Google Gemini Models (6) ---
+13. gemini-2.5-flash                 16. gemini-3-flash-preview
+...
+
+--- Batch Operations ---
+  [a] Custom model name input
+  [r] Refresh model list
+  [u] Sync scripts to ~/.local/bin
+  [q] Quit
+```
 
 ## Prerequisites
 
-- Python 3.11+ (or Python 3.10 with `tomli`)
-- Codex CLI configured in:
+- Python 3.7+
+- Codex CLI configured with:
   - `~/.codex/config.toml`
   - `~/.codex/auth.json`
 
@@ -32,44 +61,15 @@ source ~/.bashrc
 
 This will:
 
-- Install executable to `~/.local/bin/.codex-model-switch-bin`
-- Install uninstall script to `~/.local/bin/codex-model-switch-uninstall`
+- Install the script to `~/.local/bin/.codex-model-switch-bin`
 - Add `codex-model-switch` shell function to `~/.bashrc`
-- Ensure `~/.local/bin` is in PATH
+- Ensure `~/.local/bin` is in your PATH
 
-## Usage
+## Configuration
 
-### Interactive Mode
+The tool reads configuration from `~/.codex/config.toml` and auth from `~/.codex/auth.json`.
 
-```bash
-codex-model-switch
-```
-
-### Command Line Mode
-
-```bash
-codex-model-switch --list
-codex-model-switch --list-json
-codex-model-switch 10
-codex-model-switch --set gpt-5.3-codex
-codex-model-switch --show-config
-codex-model-switch --help
-```
-
-### Command Options
-
-| Option | Description |
-|---|---|
-| `--list` | List models in text format |
-| `--list-json` | List models in JSON format |
-| `INDEX` | Switch to model by index |
-| `--set MODEL_ID` | Switch to explicit model id |
-| `--provider NAME` | Override provider from config |
-| `--show-config` | Print resolved config and key source |
-
-## Config Requirements
-
-`~/.codex/config.toml` should include:
+Example `~/.codex/config.toml`:
 
 ```toml
 model_provider = "cliproxyapi"
@@ -81,7 +81,7 @@ base_url = "https://your-endpoint/v1"
 wire_api = "responses"
 ```
 
-`~/.codex/auth.json` example:
+Example `~/.codex/auth.json`:
 
 ```json
 {
@@ -89,13 +89,64 @@ wire_api = "responses"
 }
 ```
 
-## How It Works
+## Usage
 
-1. Reads provider and base URL from `~/.codex/config.toml`
-2. Resolves API key from provider-specific env vars and `~/.codex/auth.json`
-3. Tries common model endpoints (e.g. `/models`, `/v1/models`, `/api/provider/.../models`)
-4. Parses model list and displays sorted categories
-5. Writes selected model back to the top-level `model = "..."` in `~/.codex/config.toml`
+### Interactive Mode
+
+```bash
+codex-model-switch
+```
+
+### Menu Options
+
+| Key | Action |
+|-----|--------|
+| Number | Select a model, then confirm switch |
+| [m] | Set main model (model) via submenu |
+| [a] | Enter custom model name |
+| [r] | Refresh model list from API |
+| [u] | Sync script to `~/.local/bin` |
+| [q] | Quit |
+
+### Command Line Options
+
+```bash
+codex-model-switch --list        # List all models (JSON format)
+codex-model-switch 3             # Switch to model #3
+codex-model-switch --set gpt-5   # Switch by model id
+codex-model-switch --update      # Sync scripts to ~/.local/bin
+codex-model-switch --show-config # Show resolved config
+codex-model-switch --help        # Show help
+```
+
+## Updating Scripts
+
+After modifying project files, sync to `~/.local/bin`:
+
+```bash
+cd /path/to/codex-model-switch
+./codex-model-switch --update
+# or
+./install.sh
+```
+
+## Usage from Codex CLI
+
+The first time you run `codex-model-switch`, it automatically installs two tool files to `~/.codex/tools`:
+
+- `model-list.json` - List all available models with index numbers
+- `model.json` - Switch model by index number
+
+Restart Codex CLI after first run to ensure tool changes are picked up.
+
+## Auth Key Resolution
+
+Priority order:
+
+1. Provider-specific environment variables
+2. Provider-specific keys in `~/.codex/auth.json`
+3. Any `*_API_KEY` / `*_AUTH_TOKEN` in `~/.codex/auth.json`
+4. Fallback environment variables
 
 ## Uninstall
 
@@ -103,14 +154,14 @@ wire_api = "responses"
 codex-model-switch-uninstall
 ```
 
-This removes:
+This will remove:
 
 - `~/.local/bin/.codex-model-switch-bin`
 - `~/.local/bin/codex-model-switch-uninstall`
-- Optional `~/.codex/tools/model-list.json` and `~/.codex/tools/model.json`
+- `~/.codex/tools/model-list.json`
+- `~/.codex/tools/model.json`
 - Shell function from `~/.bashrc`
 
-## Notes
+## License
 
-- Uninstall does not modify `~/.codex/config.toml` or `~/.codex/auth.json`.
-- If `codex-model-switch` command is not found, run `source ~/.bashrc` and retry.
+MIT License

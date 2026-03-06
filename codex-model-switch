@@ -1,96 +1,78 @@
 #!/usr/bin/env python3
 """
 Codex Model Switch
-Switch Codex CLI model by updating ~/.codex/config.toml.
-
-Reads:
-  - ~/.codex/config.toml
-  - ~/.codex/auth.json
-
-Fetches model list from configured provider base_url, then allows:
-  - interactive switch
-  - list models
-  - switch by index
-  - switch by explicit model id
+A CLI tool to quickly switch Codex CLI default model.
+Layout and interaction style are aligned with claude-model-switch.
 """
 
-from __future__ import annotations
-
-import argparse
 import json
 import os
 import re
+import shutil
+import ssl
 import sys
 import urllib.error
 import urllib.request
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 try:  # Python 3.11+
-    import tomllib as _toml_lib
-except ModuleNotFoundError:  # Python 3.10 and below
+    import tomllib as toml_lib
+except ModuleNotFoundError:  # Python 3.10
     try:
-        import tomli as _toml_lib
-    except ModuleNotFoundError:  # pragma: no cover
-        print("Missing TOML parser: install `tomli` or use Python 3.11+.", file=sys.stderr)
+        import tomli as toml_lib
+    except ModuleNotFoundError:
+        print("Missing TOML parser: install `tomli` or use Python 3.11+.")
         sys.exit(1)
 
 
-CONFIG_FILE = Path.home() / ".codex" / "config.toml"
-AUTH_FILE = Path.home() / ".codex" / "auth.json"
+CONFIG_FILE = os.path.expanduser("~/.codex/config.toml")
+AUTH_FILE = os.path.expanduser("~/.codex/auth.json")
+TOOLS_DIR = os.path.expanduser("~/.codex/tools")
+INSTALL_DIR = os.path.expanduser("~/.local/bin")
 TIMEOUT_SECONDS = 12
 
-# ANSI colors
-RED = "\033[0;31m"
-GREEN = "\033[0;32m"
-YELLOW = "\033[1;33m"
-BLUE = "\033[0;34m"
-CYAN = "\033[0;36m"
-NC = "\033[0m"
+# ANSI color codes
+RED = '\033[0;31m'
+GREEN = '\033[0;32m'
+YELLOW = '\033[1;33m'
+BLUE = '\033[0;34m'
+CYAN = '\033[0;36m'
+NC = '\033[0m'
 
 
-def colorize(text: str, color: str) -> str:
-    if not sys.stdout.isatty():
-        return text
-    return f"{color}{text}{NC}"
+def read_text(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        return f.read()
 
 
-def read_text(path: Path) -> str:
+def load_config_data():
+    if not os.path.exists(CONFIG_FILE):
+        print(f"{RED}Config file not found: {CONFIG_FILE}{NC}")
+        return "", {}
+
     try:
-        return path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        print(colorize(f"File not found: {path}", RED), file=sys.stderr)
-        sys.exit(1)
-    except OSError as exc:
-        print(colorize(f"Failed to read {path}: {exc}", RED), file=sys.stderr)
-        sys.exit(1)
+        raw = read_text(CONFIG_FILE)
+        data = toml_lib.loads(raw)
+        return raw, data
+    except Exception as e:
+        print(f"{RED}Failed to parse config: {e}{NC}")
+        return "", {}
 
 
-def load_config() -> Tuple[str, Dict]:
-    raw = read_text(CONFIG_FILE)
-    try:
-        data = _toml_lib.loads(raw)
-    except Exception as exc:
-        print(colorize(f"Failed to parse {CONFIG_FILE}: {exc}", RED), file=sys.stderr)
-        sys.exit(1)
-    return raw, data
-
-
-def load_auth() -> Dict:
-    if not AUTH_FILE.exists():
+def load_auth_data():
+    if not os.path.exists(AUTH_FILE):
         return {}
     try:
-        raw = AUTH_FILE.read_text(encoding="utf-8")
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            return data
+        with open(AUTH_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
     except Exception:
         pass
     return {}
 
 
-def dedupe(items: Iterable[str]) -> List[str]:
+def dedupe(items):
     seen = set()
     result = []
     for item in items:
@@ -100,22 +82,20 @@ def dedupe(items: Iterable[str]) -> List[str]:
     return result
 
 
-def infer_api_key_candidates(provider: str) -> List[str]:
-    p = provider.lower()
-    keys: List[str] = []
-
-    if any(x in p for x in ("openai", "codex", "cliproxy", "oai")):
+def infer_key_candidates(provider):
+    p = (provider or "").lower()
+    keys = []
+    if any(x in p for x in ["openai", "codex", "cliproxy", "oai"]):
         keys.extend(["OPENAI_API_KEY", "OPENAI_AUTH_TOKEN"])
-    if any(x in p for x in ("anthropic", "claude")):
+    if any(x in p for x in ["anthropic", "claude"]):
         keys.extend(["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"])
-    if any(x in p for x in ("google", "gemini")):
+    if any(x in p for x in ["google", "gemini"]):
         keys.extend(["GOOGLE_API_KEY", "GEMINI_API_KEY"])
-
     return dedupe(keys)
 
 
-def resolve_api_key(provider: str, auth_data: Dict) -> Tuple[Optional[str], Optional[str]]:
-    provider_keys = infer_api_key_candidates(provider)
+def resolve_api_key(provider, auth_data):
+    provider_keys = infer_key_candidates(provider)
     fallback_keys = [
         "OPENAI_API_KEY",
         "OPENAI_AUTH_TOKEN",
@@ -125,174 +105,189 @@ def resolve_api_key(provider: str, auth_data: Dict) -> Tuple[Optional[str], Opti
         "GEMINI_API_KEY",
     ]
 
-    # 1) Provider-specific env vars
-    for key_name in provider_keys:
-        env_value = os.environ.get(key_name)
-        if env_value:
-            return env_value, f"env:{key_name}"
+    for key in provider_keys:
+        value = os.environ.get(key)
+        if value:
+            return value, f"env:{key}"
 
-    # 2) Provider-specific keys in auth.json
-    for key_name in provider_keys:
-        value = auth_data.get(key_name)
+    for key in provider_keys:
+        value = auth_data.get(key)
         if isinstance(value, str) and value:
-            return value, f"auth.json:{key_name}"
+            return value, f"auth.json:{key}"
 
-    # 3) Any API key/token in auth.json (prefer file over unrelated env vars)
-    for key_name, value in auth_data.items():
-        if isinstance(value, str) and value and key_name.upper().endswith(("_API_KEY", "_AUTH_TOKEN")):
-            return value, f"auth.json:{key_name}"
+    for key, value in auth_data.items():
+        if isinstance(value, str) and value and key.upper().endswith(("_API_KEY", "_AUTH_TOKEN")):
+            return value, f"auth.json:{key}"
 
-    # 4) Fallback env vars
-    for key_name in fallback_keys:
-        env_value = os.environ.get(key_name)
-        if env_value:
-            return env_value, f"env:{key_name}"
+    for key in fallback_keys:
+        value = os.environ.get(key)
+        if value:
+            return value, f"env:{key}"
 
-    return None, None
+    return "", ""
 
 
-def extract_origin(url: str) -> str:
+def get_provider_info(config_data):
+    provider = config_data.get("model_provider", "") if isinstance(config_data, dict) else ""
+    providers = config_data.get("model_providers", {}) if isinstance(config_data, dict) else {}
+
+    if not provider or not isinstance(providers, dict):
+        return "", "", "", ""
+
+    provider_cfg = providers.get(provider, {})
+    if not isinstance(provider_cfg, dict):
+        return provider, "", "", ""
+
+    base_url = provider_cfg.get("base_url", "")
+    wire_api = provider_cfg.get("wire_api", "")
+    model = config_data.get("model", "")
+
+    return str(provider), str(base_url), str(wire_api), str(model)
+
+
+def extract_origin(url):
     parsed = urlsplit(url)
     if not parsed.scheme or not parsed.netloc:
-        return url.rstrip("/")
+        return url.rstrip('/')
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def build_model_endpoints(base_url: str, provider: str) -> List[str]:
-    base = base_url.rstrip("/")
+def build_model_endpoints(base_url, provider):
+    base = base_url.rstrip('/')
     origin = extract_origin(base)
     p = provider.lower()
 
     endpoints = [f"{base}/models"]
-    if not base.endswith("/v1"):
+    if not base.endswith('/v1'):
         endpoints.append(f"{base}/v1/models")
 
     if "anthropic" in p or "claude" in p:
-        endpoints.extend(
-            [
-                f"{origin}/api/provider/anthropic/models",
-                f"{origin}/api/provider/anthropic/v1/models",
-                f"{origin}/api/provider/claude/models",
-                f"{origin}/api/provider/claude/v1/models",
-            ]
-        )
+        endpoints.extend([
+            f"{origin}/api/provider/anthropic/models",
+            f"{origin}/api/provider/anthropic/v1/models",
+            f"{origin}/api/provider/claude/models",
+            f"{origin}/api/provider/claude/v1/models",
+        ])
     else:
-        endpoints.extend(
-            [
-                f"{origin}/api/provider/openai/models",
-                f"{origin}/api/provider/openai/v1/models",
-                f"{origin}/api/provider/codex/models",
-                f"{origin}/api/provider/codex/v1/models",
-            ]
-        )
+        endpoints.extend([
+            f"{origin}/api/provider/openai/models",
+            f"{origin}/api/provider/openai/v1/models",
+            f"{origin}/api/provider/codex/models",
+            f"{origin}/api/provider/codex/v1/models",
+        ])
 
     return dedupe(endpoints)
 
 
-def parse_model_payload(payload: object) -> List[str]:
-    if isinstance(payload, list):
-        return parse_model_items(payload)
-    if not isinstance(payload, dict):
-        return []
-
-    for key in ("data", "models", "items", "result"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            models = parse_model_items(value)
-            if models:
-                return models
-
-    return []
-
-
-def parse_model_items(items: List[object]) -> List[str]:
-    models: List[str] = []
+def parse_model_items(items):
+    models = []
     for item in items:
         if isinstance(item, str):
-            model_id = item.strip()
-            if model_id:
-                models.append(model_id)
+            if item.strip():
+                models.append(item.strip())
             continue
         if isinstance(item, dict):
-            for key in ("id", "model", "name"):
-                value = item.get(key)
-                if isinstance(value, str) and value.strip():
-                    models.append(value.strip())
+            for k in ["id", "model", "name"]:
+                v = item.get(k)
+                if isinstance(v, str) and v.strip():
+                    models.append(v.strip())
                     break
     return dedupe(models)
 
 
-def fetch_models(base_url: str, provider: str, api_key: Optional[str]) -> Tuple[List[str], Optional[str], Optional[str]]:
-    headers = {"Accept": "application/json"}
+def parse_model_payload(data):
+    if isinstance(data, list):
+        return parse_model_items(data)
+
+    if isinstance(data, dict):
+        for key in ["data", "models", "items", "result"]:
+            value = data.get(key)
+            if isinstance(value, list):
+                models = parse_model_items(value)
+                if models:
+                    return models
+
+    return []
+
+
+def fetch_models(base_url, provider, api_key):
+    print(f"{BLUE}Fetching available models...{NC}")
+
+    headers = {'Accept': 'application/json'}
     if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        headers['Authorization'] = f'Bearer {api_key}'
 
-    errors: List[str] = []
+    ctx = ssl.create_default_context()
 
+    errors = []
     for url in build_model_endpoints(base_url, provider):
-        req = urllib.request.Request(url, headers=headers, method="GET")
+        req = urllib.request.Request(url, headers=headers, method='GET')
         try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
-            data = json.loads(body)
-            models = parse_model_payload(data)
+            with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS, context=ctx) as response:
+                payload = json.loads(response.read().decode('utf-8', errors='replace'))
+
+            models = parse_model_payload(payload)
             if models:
-                return models, url, None
-            errors.append(f"{url} -> parsed 0 models")
-        except urllib.error.HTTPError as exc:
-            errors.append(f"{url} -> HTTP {exc.code}")
-        except urllib.error.URLError as exc:
-            errors.append(f"{url} -> {exc.reason}")
-        except json.JSONDecodeError:
-            errors.append(f"{url} -> invalid JSON")
-        except Exception as exc:  # pragma: no cover
-            errors.append(f"{url} -> {exc}")
+                return models, url
+            errors.append(f"{url}: parsed 0 models")
+        except urllib.error.HTTPError as e:
+            errors.append(f"{url}: HTTP {e.code}")
+        except urllib.error.URLError as e:
+            errors.append(f"{url}: {e.reason}")
+        except Exception as e:
+            errors.append(f"{url}: {e}")
 
-    return [], None, "; ".join(errors)
-
-
-def classify_models(models: List[str]) -> Tuple[List[str], List[str], List[str], List[str]]:
-    gpt, claude, gemini, other = [], [], [], []
-    for m in models:
-        l = m.lower()
-        if any(x in l for x in ("gpt", "o1", "o3", "o4", "codex")):
-            gpt.append(m)
-        elif any(x in l for x in ("claude", "haiku", "sonnet", "opus")):
-            claude.append(m)
-        elif "gemini" in l:
-            gemini.append(m)
-        else:
-            other.append(m)
-    return sorted(gpt), sorted(claude), sorted(gemini), sorted(other)
+    print(f"{RED}Failed to fetch models{NC}")
+    if errors:
+        print(f"{YELLOW}" + " | ".join(errors) + f"{NC}")
+    return [], ""
 
 
-def order_models(models: List[str]) -> List[str]:
-    gpt, claude, gemini, other = classify_models(models)
-    return gpt + claude + gemini + other
+def classify_models(models):
+    """Classify and sort models alphabetically"""
+    gpt_models = sorted([m for m in models if any(x in m.lower() for x in
+        ['gpt', 'codex', 'o1', 'o3', 'o4'])])
+    claude_models = sorted([m for m in models if any(x in m.lower() for x in
+        ['claude', 'haiku', 'sonnet', 'opus', 'minimax']) and m not in gpt_models])
+    gemini_models = sorted([m for m in models if 'gemini' in m.lower() and m not in gpt_models and m not in claude_models])
+    other_models = sorted([m for m in models if m not in gpt_models and m not in claude_models and m not in gemini_models])
+
+    return gpt_models, claude_models, gemini_models, other_models
 
 
-def update_config_model(raw_toml: str, new_model: str) -> str:
-    lines = raw_toml.splitlines(keepends=True)
+def get_current_config():
+    """Get current configuration from ~/.codex/config.toml"""
+    raw, data = load_config_data()
+    if not raw:
+        return "", "", "", ""
+
+    provider, base_url, wire_api, model = get_provider_info(data)
+    return model, provider, base_url, wire_api
+
+
+def update_model_in_toml(raw_content, new_model):
+    lines = raw_content.splitlines(keepends=True)
     in_top_level = True
     replaced = False
 
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if stripped.startswith("["):
+        if stripped.startswith('['):
             in_top_level = False
         if not in_top_level:
             continue
-        if re.match(r"^\s*model\s*=", line):
-            newline = "\n" if line.endswith("\n") else ""
-            comment = ""
-            before = line.rstrip("\n")
-            if "#" in before:
-                left, right = before.split("#", 1)
-                if "\"" in left:
+
+        if re.match(r'^\s*model\s*=', line):
+            newline = '\n' if line.endswith('\n') else ''
+            comment = ''
+            before = line.rstrip('\n')
+            if '#' in before:
+                left, right = before.split('#', 1)
+                if '"' in left:
                     comment = f" # {right.strip()}" if right.strip() else ""
                 else:
                     comment = f" #{right}" if right else ""
-            indent = re.match(r"^(\s*)", line).group(1)
+            indent = re.match(r'^(\s*)', line).group(1)
             lines[i] = f'{indent}model = "{new_model}"{comment}{newline}'
             replaced = True
             break
@@ -301,215 +296,399 @@ def update_config_model(raw_toml: str, new_model: str) -> str:
         insert_idx = 0
         for i, line in enumerate(lines):
             stripped = line.strip()
-            if stripped.startswith("["):
+            if stripped.startswith('['):
                 insert_idx = i
                 break
-            if re.match(r"^\s*model_provider\s*=", line):
+            if re.match(r'^\s*model_provider\s*=', line):
                 insert_idx = i + 1
-        if lines and insert_idx > 0 and not lines[insert_idx - 1].endswith("\n"):
-            lines[insert_idx - 1] += "\n"
+        if lines and insert_idx > 0 and not lines[insert_idx - 1].endswith('\n'):
+            lines[insert_idx - 1] += '\n'
         lines.insert(insert_idx, f'model = "{new_model}"\n')
 
-    return "".join(lines)
+    return ''.join(lines)
 
 
-def write_config(raw_toml: str, new_model: str) -> None:
-    updated = update_config_model(raw_toml, new_model)
+def update_model(model):
+    """Update main model in ~/.codex/config.toml"""
+    if not os.path.exists(CONFIG_FILE):
+        print(f"{RED}Config file not found: {CONFIG_FILE}{NC}")
+        return False
+
     try:
-        CONFIG_FILE.write_text(updated, encoding="utf-8")
-    except OSError as exc:
-        print(colorize(f"Failed to write {CONFIG_FILE}: {exc}", RED), file=sys.stderr)
-        sys.exit(1)
+        raw = read_text(CONFIG_FILE)
+        updated = update_model_in_toml(raw, model)
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            f.write(updated)
+        return True
+    except Exception as e:
+        print(f"{RED}Failed to update model: {e}{NC}")
+        return False
 
 
-def print_model_group(title: str, models: List[str], current_model: str, start: int) -> int:
-    if not models:
-        return start
-    print(colorize(f"--- {title} ({len(models)}) ---", BLUE))
-    for idx, model in enumerate(models, start=start):
-        suffix = colorize(" *", GREEN) if model == current_model else ""
-        print(f"{idx:3d}. {model}{suffix}")
-    print("")
-    return start + len(models)
+def sync_to_install_dir():
+    """Sync current script and uninstall.sh to ~/.local/bin"""
+    script_path = os.path.abspath(__file__)
+    script_dir = os.path.dirname(script_path)
+
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+
+    # Copy main script as hidden file
+    dest_script = os.path.join(INSTALL_DIR, ".codex-model-switch-bin")
+    shutil.copy2(script_path, dest_script)
+    os.chmod(dest_script, 0o755)
+    print(f"{GREEN}Updated: {dest_script}{NC}")
+
+    # Copy uninstall script if exists
+    uninstall_src = os.path.join(script_dir, "uninstall.sh")
+    if os.path.exists(uninstall_src):
+        uninstall_dest = os.path.join(INSTALL_DIR, "codex-model-switch-uninstall")
+        shutil.copy2(uninstall_src, uninstall_dest)
+        os.chmod(uninstall_dest, 0o755)
+        print(f"{GREEN}Updated: {uninstall_dest}{NC}")
+
+    # Update Codex tools (regenerate with new paths)
+    install_codex_tools()
+
+    print(f"\n{GREEN}Sync complete!{NC}")
+    return True
 
 
-def print_menu(models: List[str], current_model: str, provider: str, base_url: str, key_source: Optional[str]) -> None:
-    print(colorize("=" * 58, GREEN))
-    print(colorize("                 Codex Model Switch", GREEN))
-    print(colorize("=" * 58, GREEN))
-    print(f"Provider: {provider}")
-    print(f"Base URL: {base_url}")
-    print(f"Current model: {current_model or 'Not set'}")
-    print(f"Auth source: {key_source or 'none (try unauthenticated)'}")
-    print("")
+def install_codex_tools():
+    """Install Codex tools configuration to ~/.codex/tools"""
+    script_path = os.path.abspath(sys.argv[0])
+    if script_path.endswith('/'):
+        script_path = script_path[:-1]
 
-    gpt, claude, gemini, other = classify_models(models)
-    idx = 1
-    idx = print_model_group("GPT/Codex Models", gpt, current_model, idx)
-    idx = print_model_group("Claude Models", claude, current_model, idx)
-    idx = print_model_group("Gemini Models", gemini, current_model, idx)
-    print_model_group("Other Models", other, current_model, idx)
+    os.makedirs(TOOLS_DIR, exist_ok=True)
 
-    print(colorize("Options:", CYAN))
-    print("  [number] switch by index")
-    print("  [m]      enter custom model id")
-    print("  [r]      refresh model list")
-    print("  [q]      quit")
-    print("")
-
-
-def select_and_switch(raw_toml: str, models: List[str], choice: str) -> Tuple[bool, Optional[str]]:
-    selected: Optional[str] = None
-
-    if choice.isdigit():
-        idx = int(choice)
-        if idx < 1 or idx > len(models):
-            print(colorize(f"Index out of range: 1-{len(models)}", RED))
-            return False, None
-        selected = models[idx - 1]
-    elif choice:
-        selected = choice
-
-    if not selected:
-        return False, None
-
-    write_config(raw_toml, selected)
-    print(colorize(f"Switched model to: {selected}", GREEN))
-    return True, selected
-
-
-def resolve_provider_info(config_data: Dict, explicit_provider: Optional[str]) -> Tuple[str, str, str]:
-    provider = explicit_provider or config_data.get("model_provider")
-    if not isinstance(provider, str) or not provider.strip():
-        print(colorize("`model_provider` is missing in ~/.codex/config.toml", RED), file=sys.stderr)
-        sys.exit(1)
-    provider = provider.strip()
-
-    providers = config_data.get("model_providers")
-    if not isinstance(providers, dict):
-        print(colorize("`[model_providers]` section missing in ~/.codex/config.toml", RED), file=sys.stderr)
-        sys.exit(1)
-
-    provider_cfg = providers.get(provider)
-    if not isinstance(provider_cfg, dict):
-        print(colorize(f"Provider `{provider}` not found in [model_providers]", RED), file=sys.stderr)
-        sys.exit(1)
-
-    base_url = provider_cfg.get("base_url")
-    if not isinstance(base_url, str) or not base_url.strip():
-        print(colorize(f"`base_url` missing for provider `{provider}`", RED), file=sys.stderr)
-        sys.exit(1)
-
-    current_model = config_data.get("model")
-    current_model = current_model.strip() if isinstance(current_model, str) else ""
-    return provider, base_url.strip(), current_model
-
-
-def list_models(models: List[str], current_model: str) -> None:
-    for idx, model in enumerate(models, start=1):
-        mark = " *" if model == current_model else ""
-        print(f"{idx:3d}. {model}{mark}")
-
-
-def list_models_json(models: List[str], current_model: str) -> None:
-    payload = {
-        "current_model": current_model,
-        "models": [{"id": m, "current": m == current_model} for m in models],
+    tools = {
+        "model-list.json": {
+            "name": "model-list",
+            "description": "List all available models with index numbers",
+            "command": ["bash", "-c", f"{script_path} --list"]
+        },
+        "model.json": {
+            "name": "model",
+            "description": "Switch model by index number",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "Model index number (see /model-list)"}
+                },
+                "required": ["index"]
+            },
+            "command": ["bash", "-c", f"{script_path} ${{index}}"]
+        }
     }
-    print(json.dumps(payload, ensure_ascii=False))
+
+    installed = []
+    for filename, tool in tools.items():
+        filepath = os.path.join(TOOLS_DIR, filename)
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(tool, f, indent=2)
+        installed.append(filepath)
+
+    print(f"{GREEN}Installed {len(installed)} Codex tools:{NC}")
+    for path in installed:
+        print(f"  - {path}")
+    print(f"{YELLOW}Please restart Codex CLI to use the new tools.{NC}")
+    return True
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="codex-model-switch",
-        description="Switch Codex model in ~/.codex/config.toml",
-    )
-    parser.add_argument("index", nargs="?", help="Model index to switch to")
-    parser.add_argument("-l", "--list", action="store_true", help="List models")
-    parser.add_argument("--list-json", action="store_true", help="List models as JSON")
-    parser.add_argument("-s", "--set", dest="set_model", help="Set model by id directly")
-    parser.add_argument("-p", "--provider", help="Override provider name from config")
-    parser.add_argument("--show-config", action="store_true", help="Print resolved config and exit")
-    return parser.parse_args()
+def strip_ansi(text):
+    """Remove ANSI escape codes"""
+    return re.sub(r'\x1B\[[0-9;]*[mK]', '', text)
 
 
-def fetch_models_or_exit(base_url: str, provider: str, api_key: Optional[str]) -> Tuple[List[str], str]:
-    models, used_url, error = fetch_models(base_url, provider, api_key)
-    if not models:
-        print(colorize("Failed to fetch models from provider endpoints.", RED), file=sys.stderr)
-        if error:
-            print(colorize(error, YELLOW), file=sys.stderr)
+def print_two_columns(items, current_model, start_idx):
+    """Display model list in two columns"""
+    if not items:
+        return start_idx
+
+    # Calculate column width dynamically
+    max_len = 0
+    for i, item in enumerate(items):
+        num = start_idx + i
+        item_str = f"{num}. {item}"
+        max_len = max(max_len, len(item_str))
+
+    col_width = max_len + 4
+    rows = (len(items) + 1) // 2
+
+    for i in range(rows):
+        left_idx = i
+        right_idx = i + rows if i + rows < len(items) else None
+
+        left = items[left_idx]
+        left_is_selected = (left == current_model)
+        if left_is_selected:
+            left_str = f"{GREEN}{start_idx + left_idx}. {left} *{NC}"
+        else:
+            left_str = f"{start_idx + left_idx}. {left}"
+
+        if right_idx is not None:
+            right = items[right_idx]
+            right_is_selected = (right == current_model)
+            if right_is_selected:
+                right_str = f"{GREEN}{start_idx + right_idx}. {right} *{NC}"
+            else:
+                right_str = f"{start_idx + right_idx}. {right}"
+            print(left_str + " " * (col_width - len(strip_ansi(left_str))) + right_str)
+        else:
+            if left_is_selected:
+                print(f"{GREEN}{start_idx + left_idx}. {left} *{NC}")
+            else:
+                print(left_str)
+
+    return start_idx + len(items)
+
+
+def show_menu(gpt_models, claude_models, gemini_models, other_models, config):
+    """Display menu"""
+    api_display = extract_origin(config[2]) if config[2] else "Not Set"
+
+    print("\n" + GREEN + "=" * 60 + NC)
+    print(GREEN + "             Codex CLI Model Switch" + NC)
+    print(GREEN + "=" * 60 + NC)
+    print("")
+    print(f"{YELLOW}API: {api_display}{NC}")
+    print("")
+    print(f"{YELLOW}Current Configuration:{NC}")
+    print(f"  Main Model (model):                {config[0] or 'Not Set'}")
+    print(f"  Provider (model_provider):         {config[1] or 'Not Set'}")
+    print(f"  Wire API:                          {config[3] or 'Not Set'}")
+    print("")
+
+    idx = 1
+
+    if gpt_models:
+        print(f"{BLUE}--- GPT/Codex Models ({len(gpt_models)}) ---{NC}")
+        idx = print_two_columns(gpt_models, config[0], idx)
+        print("")
+
+    if claude_models:
+        print(f"{BLUE}--- Claude Compatible Models ({len(claude_models)}) ---{NC}")
+        idx = print_two_columns(claude_models, config[0], idx)
+        print("")
+
+    if gemini_models:
+        print(f"{BLUE}--- Google Gemini Models ({len(gemini_models)}) ---{NC}")
+        idx = print_two_columns(gemini_models, config[0], idx)
+        print("")
+
+    if other_models:
+        print(f"{BLUE}--- Other Models ({len(other_models)}) ---{NC}")
+        idx = print_two_columns(other_models, config[0], idx)
+        print("")
+
+    print(f"{CYAN}--- Set Individual Models ---{NC}")
+    print("  [m] Set Main Model (model)")
+    print("")
+    print(f"{CYAN}--- Batch Operations ---{NC}")
+    print("  [a] Custom model name input")
+    print("  [r] Refresh model list")
+    print("  [u] Sync scripts to ~/.local/bin")
+    print("  [q] Quit")
+    print("")
+
+
+def select_model_menu(gpt_models, claude_models, gemini_models, other_models, target_name):
+    """Model selection submenu"""
+    print(f"\n{target_name} Model Selection:")
+    all_models = gpt_models + claude_models + gemini_models + other_models
+    for idx, model in enumerate(all_models, 1):
+        print(f"  {idx}. {model}")
+    print("  [q] Back")
+    choice = input("Choose: ").strip()
+    if choice.isdigit() and 1 <= int(choice) <= len(all_models):
+        return all_models[int(choice) - 1]
+    return None
+
+
+def list_models_json(models):
+    """List all models in JSON format for tools"""
+    result = {"models": [{"id": m} for m in models]}
+    print(json.dumps(result))
+
+
+def switch_model_by_index(index, models):
+    """Switch model by index number"""
+    try:
+        idx = int(index)
+        if idx < 1 or idx > len(models):
+            print(f'{{"error": "Invalid index. Available range: 1-{len(models)}"}}')
+            return
+
+        selected_model = models[idx - 1]
+        if update_model(selected_model):
+            print(json.dumps({
+                "success": True,
+                "model": selected_model,
+                "message": f"Model switched to {selected_model}."
+            }))
+    except ValueError:
+        print('{"error": "Invalid index. Please provide a number."}')
+
+
+def print_help():
+    print("Usage: codex-model-switch [OPTIONS] [INDEX]")
+    print("")
+    print("Options:")
+    print("  -l, --list         List all models (JSON format)")
+    print("  -u, --update       Sync scripts to ~/.local/bin")
+    print("  --set MODEL        Set model directly by model id")
+    print("  --show-config      Show resolved codex config")
+    print("  INDEX              Switch to model by index number")
+    print("  -h, --help         Show this help message")
+
+
+def main():
+    if not sys.version_info >= (3, 7):
+        print(f"{RED}Python 3.7+ required{NC}")
         sys.exit(1)
-    return order_models(models), used_url or f"{base_url.rstrip('/')}/models"
 
+    raw_config, config_data = load_config_data()
+    if not raw_config:
+        sys.exit(1)
 
-def main() -> None:
-    args = parse_args()
-    raw_toml, config_data = load_config()
-    auth_data = load_auth()
+    provider, base_url, wire_api, current_model = get_provider_info(config_data)
+    if not provider or not base_url:
+        print(f"{RED}Invalid ~/.codex/config.toml: missing model_provider or provider base_url{NC}")
+        sys.exit(1)
 
-    provider, base_url, current_model = resolve_provider_info(config_data, args.provider)
+    auth_data = load_auth_data()
     api_key, key_source = resolve_api_key(provider, auth_data)
 
-    if args.show_config:
-        print(f"config_file={CONFIG_FILE}")
-        print(f"auth_file={AUTH_FILE}")
-        print(f"provider={provider}")
-        print(f"base_url={base_url}")
-        print(f"current_model={current_model or '(not set)'}")
-        print(f"api_key_source={key_source or '(none)'}")
-        return
+    # Parse command line arguments (keep layout close to claude-model-switch)
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
 
-    if args.set_model:
-        select_and_switch(raw_toml, [], args.set_model.strip())
-        return
+        if arg in ['--list', '-l', '--list-json']:
+            models, _ = fetch_models(base_url, provider, api_key)
+            if not models:
+                print('{"error": "Failed to fetch models"}')
+                return
 
-    if args.index:
-        models, _ = fetch_models_or_exit(base_url, provider, api_key)
-        if not args.index.isdigit():
-            print(colorize("Index must be a number.", RED), file=sys.stderr)
-            sys.exit(1)
-        ok, _ = select_and_switch(raw_toml, models, args.index)
-        if not ok:
-            sys.exit(1)
-        return
+            gpt_models, claude_models, gemini_models, other_models = classify_models(models)
+            sorted_models = gpt_models + claude_models + gemini_models + other_models
+            list_models_json(sorted_models)
+            return
 
-    if args.list or args.list_json:
-        models, _ = fetch_models_or_exit(base_url, provider, api_key)
-        if args.list_json:
-            list_models_json(models, current_model)
-        else:
-            list_models(models, current_model)
+        if arg in ['--update', '-u', '--sync']:
+            print(f"{BLUE}Syncing scripts to {INSTALL_DIR}...{NC}")
+            sync_to_install_dir()
+            return
+
+        if arg in ['--help', '-h']:
+            print_help()
+            return
+
+        if arg == '--show-config':
+            print(f"config_file={CONFIG_FILE}")
+            print(f"auth_file={AUTH_FILE}")
+            print(f"provider={provider}")
+            print(f"base_url={base_url}")
+            print(f"wire_api={wire_api or '(not set)'}")
+            print(f"current_model={current_model or '(not set)'}")
+            print(f"api_key_source={key_source or '(none)'}")
+            return
+
+        if arg == '--set':
+            if len(sys.argv) < 3:
+                print('{"error": "Missing model id for --set"}')
+                return
+            model_id = sys.argv[2].strip()
+            if not model_id:
+                print('{"error": "Model id cannot be empty"}')
+                return
+            if update_model(model_id):
+                print(json.dumps({"success": True, "model": model_id, "message": f"Model switched to {model_id}."}))
+            return
+
+        if arg.isdigit():
+            models, _ = fetch_models(base_url, provider, api_key)
+            if not models:
+                print('{"error": "Failed to fetch models"}')
+                return
+            gpt_models, claude_models, gemini_models, other_models = classify_models(models)
+            sorted_models = gpt_models + claude_models + gemini_models + other_models
+            switch_model_by_index(arg, sorted_models)
+            return
+
+        print_help()
         return
 
     # Interactive mode
-    models, used_url = fetch_models_or_exit(base_url, provider, api_key)
-    print(colorize(f"Fetched {len(models)} models from: {used_url}", GREEN))
+    model_list_tool = os.path.join(TOOLS_DIR, "model-list.json")
+    model_tool = os.path.join(TOOLS_DIR, "model.json")
+    if not (os.path.exists(model_list_tool) and os.path.exists(model_tool)):
+        print(f"{YELLOW}Installing Codex tools...{NC}")
+        install_codex_tools()
+        print("")
+
+    all_models, used_url = fetch_models(base_url, provider, api_key)
+    if not all_models:
+        print(f"{RED}Failed to fetch models, exiting{NC}")
+        sys.exit(1)
+
+    if key_source:
+        print(f"{CYAN}Auth source: {key_source}{NC}")
+    print(f"{GREEN}Found {len(all_models)} models{NC}")
+
+    gpt_models, claude_models, gemini_models, other_models = classify_models(all_models)
+    config = get_current_config()
 
     while True:
-        _, config_data = load_config()
-        current_model = config_data.get("model", "") if isinstance(config_data.get("model"), str) else ""
-        print("")
-        print_menu(models, current_model, provider, base_url, key_source)
+        show_menu(gpt_models, claude_models, gemini_models, other_models, config)
         choice = input("Enter option: ").strip()
 
-        if not choice:
-            continue
-        if choice.lower() == "q":
-            return
-        if choice.lower() == "r":
-            models, used_url = fetch_models_or_exit(base_url, provider, api_key)
-            print(colorize(f"Refreshed model list from: {used_url}", GREEN))
-            continue
-        if choice.lower() == "m":
-            custom = input("Enter model id: ").strip()
-            if custom:
-                raw_toml, _ = load_config()
-                select_and_switch(raw_toml, models, custom)
-            continue
+        all_model_list = gpt_models + claude_models + gemini_models + other_models
 
-        raw_toml, _ = load_config()
-        select_and_switch(raw_toml, models, choice)
+        if choice.isdigit() and 1 <= int(choice) <= len(all_model_list):
+            idx = int(choice) - 1
+            selected_model = all_model_list[idx]
+            print(f"\nSelected model: {selected_model}")
+            print("  [1] Set Main Model (model)")
+            print("  [q] Back")
+            sub_choice = input("Choose: ").strip().lower()
+            if sub_choice == '1':
+                if update_model(selected_model):
+                    print(f"{GREEN}Set Main Model to: {selected_model}{NC}")
+            config = get_current_config()
+
+        elif choice.lower() == 'm':
+            selected = select_model_menu(gpt_models, claude_models, gemini_models, other_models, "Main")
+            if selected and update_model(selected):
+                print(f"{GREEN}Set Main Model to: {selected}{NC}")
+                config = get_current_config()
+
+        elif choice.lower() == 'a':
+            custom_model = input("Enter model name: ").strip()
+            if custom_model:
+                if update_model(custom_model):
+                    print(f"{GREEN}Set model to: {custom_model}{NC}")
+                config = get_current_config()
+
+        elif choice.lower() == 'r':
+            all_models, used_url = fetch_models(base_url, provider, api_key)
+            if all_models:
+                gpt_models, claude_models, gemini_models, other_models = classify_models(all_models)
+                print(f"{GREEN}Refreshed models ({len(all_models)}) from: {used_url}{NC}")
+            else:
+                print(f"{RED}Failed to refresh models{NC}")
+            config = get_current_config()
+
+        elif choice.lower() == 'u':
+            sync_to_install_dir()
+
+        elif choice.lower() == 'q':
+            print("Goodbye!")
+            break
+
+        else:
+            print(f"{RED}Invalid option{NC}")
+
+        input("\nPress Enter to continue...")
 
 
 if __name__ == "__main__":
