@@ -7,6 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$HOME/.local/bin"
 SCRIPT_NAME=".codex-model-switch-bin"
+CMD_NAME="codex-model-switch"
 UNINSTALL_NAME="codex-model-switch-uninstall"
 BASHRC="$HOME/.bashrc"
 
@@ -29,6 +30,11 @@ echo -e "${YELLOW}Installing codex-model-switch...${NC}"
 cp "$SCRIPT_DIR/codex-model-switch" "$INSTALL_DIR/$SCRIPT_NAME"
 chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
 echo -e "  Installed: $INSTALL_DIR/$SCRIPT_NAME"
+
+# Copy direct command path to avoid stale old versions
+cp "$SCRIPT_DIR/codex-model-switch" "$INSTALL_DIR/$CMD_NAME"
+chmod +x "$INSTALL_DIR/$CMD_NAME"
+echo -e "  Installed: $INSTALL_DIR/$CMD_NAME"
 
 # Copy uninstall script
 echo -e "${YELLOW}Installing uninstall script...${NC}"

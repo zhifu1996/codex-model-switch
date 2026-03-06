@@ -40,6 +40,35 @@ CYAN = '\033[0;36m'
 NC = '\033[0m'
 
 
+def strip_terminal_escape(text):
+    """Remove terminal escape sequences from user input."""
+    if not isinstance(text, str):
+        return ""
+    text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
+    text = text.replace('\x1b', '')
+    return text
+
+
+def normalize_menu_input(text):
+    return strip_terminal_escape(text).strip()
+
+
+def normalize_model_input(text):
+    return strip_terminal_escape(text).strip()
+
+
+def validate_model_name(model):
+    if not model:
+        return False, "Model name cannot be empty"
+    if '"' in model:
+        return False, 'Model name cannot contain double quote (")'
+    for ch in model:
+        code = ord(ch)
+        if code < 32 or code == 127:
+            return False, "Model name contains control characters"
+    return True, ""
+
+
 def read_text(path):
     with open(path, 'r', encoding='utf-8') as f:
         return f.read()
@@ -310,6 +339,12 @@ def update_model_in_toml(raw_content, new_model):
 
 def update_model(model):
     """Update main model in ~/.codex/config.toml"""
+    model = normalize_model_input(model)
+    ok, err = validate_model_name(model)
+    if not ok:
+        print(f"{RED}{err}{NC}")
+        return False
+
     if not os.path.exists(CONFIG_FILE):
         print(f"{RED}Config file not found: {CONFIG_FILE}{NC}")
         return False
@@ -337,6 +372,12 @@ def sync_to_install_dir():
     shutil.copy2(script_path, dest_script)
     os.chmod(dest_script, 0o755)
     print(f"{GREEN}Updated: {dest_script}{NC}")
+
+    # Also keep a direct executable command path in sync
+    command_script = os.path.join(INSTALL_DIR, "codex-model-switch")
+    shutil.copy2(script_path, command_script)
+    os.chmod(command_script, 0o755)
+    print(f"{GREEN}Updated: {command_script}{NC}")
 
     # Copy uninstall script if exists
     uninstall_src = os.path.join(script_dir, "uninstall.sh")
@@ -400,16 +441,44 @@ def strip_ansi(text):
     return re.sub(r'\x1B\[[0-9;]*[mK]', '', text)
 
 
+def truncate_text(text, max_len):
+    """Truncate plain text to max_len using ASCII ellipsis."""
+    if max_len <= 0:
+        return ""
+    if len(text) <= max_len:
+        return text
+    if max_len <= 3:
+        return text[:max_len]
+    return text[:max_len - 3] + "..."
+
+
+def format_model_entry(num, model, current_model, col_width):
+    """Format one model line entry; highlight model name only when selected."""
+    prefix = f"{num}. "
+    max_model_len = max(1, col_width - len(prefix))
+    model_display = truncate_text(model, max_model_len)
+
+    if model == current_model:
+        entry = f"{prefix}{GREEN}{model_display}{NC}"
+    else:
+        entry = f"{prefix}{model_display}"
+
+    visible_len = len(prefix) + len(model_display)
+    return entry, visible_len
+
+
 def print_two_columns(items, current_model, start_idx):
-    """Display model list in two columns"""
+    """Display model list in two columns (claude-model-switch style)."""
     if not items:
         return start_idx
 
-    # Calculate column width dynamically
+    # Calculate column width based on longest item text
     max_len = 0
     for i, item in enumerate(items):
         num = start_idx + i
         item_str = f"{num}. {item}"
+        if item == current_model:
+            item_str += " *"
         max_len = max(max_len, len(item_str))
 
     col_width = max_len + 4
@@ -420,25 +489,19 @@ def print_two_columns(items, current_model, start_idx):
         right_idx = i + rows if i + rows < len(items) else None
 
         left = items[left_idx]
-        left_is_selected = (left == current_model)
-        if left_is_selected:
-            left_str = f"{GREEN}{start_idx + left_idx}. {left} *{NC}"
-        else:
-            left_str = f"{start_idx + left_idx}. {left}"
+        left_selected = (left == current_model)
+        left_plain = f"{start_idx + left_idx}. {left}" + (" *" if left_selected else "")
+        left_str = f"{GREEN}{left_plain}{NC}" if left_selected else left_plain
 
         if right_idx is not None:
             right = items[right_idx]
-            right_is_selected = (right == current_model)
-            if right_is_selected:
-                right_str = f"{GREEN}{start_idx + right_idx}. {right} *{NC}"
-            else:
-                right_str = f"{start_idx + right_idx}. {right}"
+            right_selected = (right == current_model)
+            right_plain = f"{start_idx + right_idx}. {right}" + (" *" if right_selected else "")
+            right_str = f"{GREEN}{right_plain}{NC}" if right_selected else right_plain
+
             print(left_str + " " * (col_width - len(strip_ansi(left_str))) + right_str)
         else:
-            if left_is_selected:
-                print(f"{GREEN}{start_idx + left_idx}. {left} *{NC}")
-            else:
-                print(left_str)
+            print(left_str)
 
     return start_idx + len(items)
 
@@ -499,7 +562,7 @@ def select_model_menu(gpt_models, claude_models, gemini_models, other_models, ta
     for idx, model in enumerate(all_models, 1):
         print(f"  {idx}. {model}")
     print("  [q] Back")
-    choice = input("Choose: ").strip()
+    choice = normalize_menu_input(input("Choose: "))
     if choice.isdigit() and 1 <= int(choice) <= len(all_models):
         return all_models[int(choice) - 1]
     return None
@@ -597,9 +660,10 @@ def main():
             if len(sys.argv) < 3:
                 print('{"error": "Missing model id for --set"}')
                 return
-            model_id = sys.argv[2].strip()
-            if not model_id:
-                print('{"error": "Model id cannot be empty"}')
+            model_id = normalize_model_input(sys.argv[2])
+            ok, err = validate_model_name(model_id)
+            if not ok:
+                print(json.dumps({"error": err}))
                 return
             if update_model(model_id):
                 print(json.dumps({"success": True, "model": model_id, "message": f"Model switched to {model_id}."}))
@@ -640,7 +704,7 @@ def main():
 
     while True:
         show_menu(gpt_models, claude_models, gemini_models, other_models, config)
-        choice = input("Enter option: ").strip()
+        choice = normalize_menu_input(input("Enter option: "))
 
         all_model_list = gpt_models + claude_models + gemini_models + other_models
 
@@ -650,7 +714,7 @@ def main():
             print(f"\nSelected model: {selected_model}")
             print("  [1] Set Main Model (model)")
             print("  [q] Back")
-            sub_choice = input("Choose: ").strip().lower()
+            sub_choice = normalize_menu_input(input("Choose: ")).lower()
             if sub_choice == '1':
                 if update_model(selected_model):
                     print(f"{GREEN}Set Main Model to: {selected_model}{NC}")
@@ -663,11 +727,15 @@ def main():
                 config = get_current_config()
 
         elif choice.lower() == 'a':
-            custom_model = input("Enter model name: ").strip()
-            if custom_model:
-                if update_model(custom_model):
-                    print(f"{GREEN}Set model to: {custom_model}{NC}")
-                config = get_current_config()
+            custom_model = normalize_model_input(input("Enter model name: "))
+            ok, err = validate_model_name(custom_model)
+            if not ok:
+                print(f"{RED}{err}{NC}")
+                input("\nPress Enter to continue...")
+                continue
+            if update_model(custom_model):
+                print(f"{GREEN}Set model to: {custom_model}{NC}")
+            config = get_current_config()
 
         elif choice.lower() == 'r':
             all_models, used_url = fetch_models(base_url, provider, api_key)

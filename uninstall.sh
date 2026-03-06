@@ -7,6 +7,7 @@ echo "=========================================="
 echo ""
 
 SCRIPT_PATH="$HOME/.local/bin/.codex-model-switch-bin"
+CMD_PATH="$HOME/.local/bin/codex-model-switch"
 UNINSTALL_SCRIPT="$HOME/.local/bin/codex-model-switch-uninstall"
 TOOLS_DIR="$HOME/.codex/tools"
 BASHRC="$HOME/.bashrc"
@@ -14,15 +15,19 @@ FUNC_MARKER="# Codex Model Switch - shell wrapper"
 
 echo "The following will be removed:"
 echo "  1. $SCRIPT_PATH"
-echo "  2. $UNINSTALL_SCRIPT"
-echo "  3. $TOOLS_DIR/model-list.json (if exists)"
-echo "  4. $TOOLS_DIR/model.json (if exists)"
-echo "  5. Shell function 'codex-model-switch' from ~/.bashrc"
+echo "  2. $CMD_PATH"
+echo "  3. $UNINSTALL_SCRIPT"
+echo "  4. $TOOLS_DIR/model-list.json (if exists)"
+echo "  5. $TOOLS_DIR/model.json (if exists)"
+echo "  6. Shell function 'codex-model-switch' from ~/.bashrc"
 echo ""
 
 files_to_delete=()
 if [ -f "$SCRIPT_PATH" ]; then
     files_to_delete+=("$SCRIPT_PATH")
+fi
+if [ -f "$CMD_PATH" ]; then
+    files_to_delete+=("$CMD_PATH")
 fi
 if [ -f "$UNINSTALL_SCRIPT" ]; then
     files_to_delete+=("$UNINSTALL_SCRIPT")
